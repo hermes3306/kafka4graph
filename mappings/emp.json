@@ -1,0 +1,14 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "emp"
+  },
+  "target": {
+    "type": "node",
+    "label": "Emp"
+  },
+  "columns": {
+    "id": "id",
+    "name": "name"
+  }
+}
