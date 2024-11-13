@@ -64,6 +64,14 @@ class DataIntegrationIDE:
                         status TEXT,
                         details TEXT)''')
             
+
+            # Add to init_monitoring_db method:
+            c.execute('''CREATE TABLE IF NOT EXISTS sync_progress
+                        (rule_name TEXT PRIMARY KEY,
+                        last_id INTEGER,
+                        last_sync TEXT,
+                        status TEXT)''')
+            
             # Topic status table
             c.execute('''CREATE TABLE IF NOT EXISTS topic_status
                         (topic_id TEXT PRIMARY KEY,
@@ -359,7 +367,7 @@ class DataIntegrationIDE:
             
         except Exception as e:
             self.logger.error(f"Failed to track sync operation: {str(e)}")
-                
+                    
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Data Integration IDE")
@@ -413,6 +421,7 @@ class DataIntegrationIDE:
             self.logger.error(f"Failed to start background threads: {str(e)}")
             return False
 
+
     def source_thread_process(self, rule_name):
         """Continuous source processing thread"""
         try:
@@ -427,9 +436,16 @@ class DataIntegrationIDE:
                 'acks': 'all'
             })
             
+            # Get or initialize last processed ID
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('SELECT last_id FROM sync_progress WHERE rule_name = ?', (rule_name,))
+            result = c.fetchone()
+            last_processed_id = result[0] if result else 0
+            conn.close()
+
             while not self.thread_stop_flags.get(rule_name, True):
                 try:
-                    # Get new data from source
                     if mapping['source']['type'] == 'postgresql':
                         import psycopg2
                         from psycopg2.extras import RealDictCursor
@@ -438,24 +454,47 @@ class DataIntegrationIDE:
                         conn = psycopg2.connect(**config)
                         cursor = conn.cursor(cursor_factory=RealDictCursor)
                         
-                        # Get latest records (implement your own logic here)
-                        cursor.execute(f"SELECT * FROM {mapping['source']['table']}")
+                        # Query for new records only
+                        cursor.execute(f"""
+                            SELECT * FROM {mapping['source']['table']}
+                            WHERE id > %s
+                            ORDER BY id
+                            LIMIT 1000
+                        """, (last_processed_id,))
+                        
                         rows = cursor.fetchall()
+                        if rows:
+                            for row in rows:
+                                message = self.prepare_message(row)
+                                if message:
+                                    try:
+                                        key = str(row['id'])
+                                        producer.produce(
+                                            source_topic,
+                                            key=key.encode('utf-8'),
+                                            value=json.dumps(message).encode('utf-8'),
+                                            on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
+                                        )
+                                        last_processed_id = row['id']
+                                    except Exception as e:
+                                        self.logger.error(f"Error producing message: {str(e)}")
+                                        
+                            producer.flush()
+                            
+                            # Update progress in database
+                            conn_monitor = sqlite3.connect('monitoring.db')
+                            c = conn_monitor.cursor()
+                            c.execute('''INSERT OR REPLACE INTO sync_progress 
+                                        (rule_name, last_id, last_sync, status)
+                                        VALUES (?, ?, datetime('now'), ?)''',
+                                    (rule_name, last_processed_id, 'RUNNING'))
+                            conn_monitor.commit()
+                            conn_monitor.close()
                         
-                        for row in rows:
-                            message = self.prepare_message(row)
-                            producer.produce(
-                                source_topic,
-                                key=str(uuid.uuid4()).encode('utf-8'),
-                                value=json.dumps(message).encode('utf-8'),
-                                on_delivery=lambda err, msg: self.delivery_callback(err, msg, rule_name)
-                            )
-                        
-                        producer.flush()
                         conn.close()
                     
-                    # Sleep before next check
-                    time.sleep(10)  # Adjust interval as needed
+                    # Sleep before next check (adjust interval as needed)
+                    time.sleep(5)  # Check every 5 seconds
                     
                 except Exception as e:
                     self.logger.error(f"Error in source thread: {str(e)}")
@@ -464,7 +503,54 @@ class DataIntegrationIDE:
         except Exception as e:
             self.logger.error(f"Source thread failed: {str(e)}")
         finally:
-            producer.flush()
+            if 'producer' in locals():
+                producer.flush()
+
+
+    def get_sync_status(self, rule_name):
+        """Get current sync status for a rule"""
+        try:
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('''SELECT last_id, last_sync, status 
+                        FROM sync_progress 
+                        WHERE rule_name = ?''', (rule_name,))
+            result = c.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'last_id': result[0],
+                    'last_sync': result[1],
+                    'status': result[2]
+                }
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get sync status: {str(e)}")
+            return None
+                
+    def prepare_message(self, row):
+        """Prepare message from database row with type handling"""
+        try:
+            message = {}
+            for column, value in row.items():
+                if value is not None:
+                    if isinstance(value, (datetime, date)):
+                        value = value.isoformat()
+                    elif isinstance(value, (Decimal, UUID)):
+                        value = str(value)
+                    elif isinstance(value, bytes):
+                        value = value.hex()
+                    elif isinstance(value, dict):
+                        value = json.dumps(value)
+                    else:
+                        value = str(value)
+                message[column] = value
+            return message
+        except Exception as e:
+            self.logger.error(f"Error preparing message: {str(e)}")
+            return None
+
 
     def sink_thread_process(self, rule_name):
         """Continuous sink processing thread"""
@@ -531,6 +617,15 @@ class DataIntegrationIDE:
                 
             if rule_name in self.sink_threads:
                 self.sink_threads[rule_name] = None
+                
+            # Update status in database
+            conn = sqlite3.connect('monitoring.db')
+            c = conn.cursor()
+            c.execute('''UPDATE sync_progress 
+                        SET status = 'STOPPED'
+                        WHERE rule_name = ?''', (rule_name,))
+            conn.commit()
+            conn.close()
                 
             self.logger.info(f"Stopped background threads for rule: {rule_name}")
             
@@ -3589,6 +3684,12 @@ class DataIntegrationIDE:
                             "Error"
                         ))
 
+            # Add to the refresh_data function in show_rule_topics:
+            sync_status = self.get_sync_status(rule_name)
+            if sync_status:
+                ttk.Label(status_frame, text=f"Last Sync: {sync_status['last_sync']}\n"
+                                            f"Status: {sync_status['status']}").pack()
+                
             # Add buttons at the bottom
             ttk.Button(button_frame, text="Refresh", 
                     command=refresh_data).pack(side='left', padx=5)
@@ -3605,6 +3706,8 @@ class DataIntegrationIDE:
                     command=lambda: self.start_background_threads(rule_name)).pack(side='left', padx=5)
             ttk.Button(button_frame, text="Stop Processing",
                     command=lambda: self.stop_background_threads(rule_name)).pack(side='left', padx=5)
+            
+
 
             # Initial data load
             refresh_data()

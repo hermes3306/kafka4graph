@@ -1,0 +1,17 @@
+{
+  "source": {
+    "type": "postgresql",
+    "table": "orders"
+  },
+  "target": {
+    "type": "node",
+    "label": "Orders"
+  },
+  "columns": {
+    "id": "id",
+    "customer_id": "customer_id",
+    "order_date": "order_date",
+    "total_amount": "total_amount",
+    "status": "status"
+  }
+}
